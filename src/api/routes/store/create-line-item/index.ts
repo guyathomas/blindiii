@@ -1,17 +1,17 @@
 import { IsInt, IsOptional, IsString } from "class-validator";
 import { EntityManager } from "typeorm";
-import { validator } from "../../../../../utils/validator";
-import {
-  CreateLineItemSteps,
-  handleAddOrUpdateLineItem,
-} from "./utils/handler-steps";
-import { IdempotencyKey } from "../../../../../models";
+import { IdempotencyKey } from "@medusajs/medusa";
+import { validator } from "@medusajs/medusa/dist/utils/validator";
 import {
   initializeIdempotencyRequest,
   runIdempotencyStep,
   RunIdempotencyStepOptions,
-} from "../../../../../utils/idempotency";
-import { cleanResponseData } from "../../../../../utils/clean-response-data";
+} from "@medusajs/medusa/dist/utils/idempotency";
+import { cleanResponseData } from "@medusajs/medusa/dist/utils/clean-response-data";
+import {
+  CreateLineItemSteps,
+  handleAddOrUpdateLineItem,
+} from "./utils/handler-steps";
 
 /**
  * @oas [post] /store/carts/{id}/line-items
