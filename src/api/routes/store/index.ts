@@ -1,14 +1,21 @@
 import { Router } from "express";
-import customRouteHandler from "./custom-route-handler";
-import { wrapHandler } from "@medusajs/medusa";
-
-// Initialize a custom router
-const router = Router();
+import customCreateLineItem from "./create-line-item";
+import {
+  FindParams,
+  defaultStoreCartFields,
+  defaultStoreCartRelations,
+  transformStoreQuery,
+  wrapHandler,
+} from "@medusajs/medusa";
 
 export function attachStoreRoutes(storeRouter: Router) {
-  // Attach our router to a custom path on the store router
-  storeRouter.use("/custom", router);
-
-  // Define a GET endpoint on the root route of our custom path
-  router.get("/", wrapHandler(customRouteHandler));
+  storeRouter.post(
+    "/carts/:id/line-items",
+    transformStoreQuery(FindParams, {
+      defaultRelations: defaultStoreCartRelations,
+      defaultFields: defaultStoreCartFields,
+      isList: false,
+    }),
+    wrapHandler(customCreateLineItem)
+  );
 }
