@@ -32,17 +32,32 @@ export async function handleAddOrUpdateLineItem(
   const lineItemService: LineItemService = container.resolve("lineItemService");
   const featureFlagRouter: FlagRouter = container.resolve("featureFlagRouter");
 
+  const pricingService: PricingService = container.resolve("pricingService");
   const txCartService = cartService.withTransaction(manager);
 
   let cart = await txCartService.retrieve(cartId, {
     select: ["id", "region_id", "customer_id"],
   });
 
+  const variantPricing = await pricingService.getProductVariantPricingWithMeta(
+    {
+      variantId: data.variant_id,
+      quantity: data.quantity,
+      metadata: data.metadata,
+    },
+    {
+      region_id: cart.region_id,
+      customer_id: cart.customer_id,
+      include_discount_prices: true,
+    }
+  );
+
   const line = await lineItemService
     .withTransaction(manager)
     .generate(data.variant_id, cart.region_id, data.quantity, {
       customer_id: data.customer_id || cart.customer_id,
       metadata: data.metadata,
+      unit_price: variantPricing.calculated_price,
     });
 
   await txCartService.addLineItem(cart.id, line, {
