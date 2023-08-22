@@ -1,316 +1,45 @@
-import { FlagRouter } from "@medusajs/utils";
-import { MedusaError } from "medusa-core-utils";
-import { EntityManager } from "typeorm";
-import { ProductVariantService, RegionService, TaxProviderService } from ".";
-import { TransactionBaseService } from "../interfaces";
 import {
-  IPriceSelectionStrategy,
+  PricingService as MedusaPricingService,
+  MoneyAmount,
+} from "@medusajs/medusa";
+import {
   PriceSelectionContext,
-} from "../interfaces/price-selection-strategy";
-import TaxInclusivePricingFeatureFlag from "../loaders/feature-flags/tax-inclusive-pricing";
-import { Product, ProductVariant, Region, ShippingOption } from "../models";
+  PriceType,
+} from "@medusajs/medusa/dist/interfaces/price-selection-strategy";
 import {
-  PricedProduct,
-  PricedShippingOption,
-  PricedVariant,
   PricingContext,
   ProductVariantPricing,
-  TaxedPricing,
-} from "../types/pricing";
-import { TaxServiceRate } from "../types/tax-service";
-import { calculatePriceTaxAmount } from "../utils";
+} from "@medusajs/medusa/dist/types/pricing";
+import { TaxServiceRate } from "@medusajs/medusa/dist/types/tax-service";
+import { PriceSelectionResult } from "@medusajs/medusa/dist/interfaces/price-selection-strategy";
+import MoneyAmountRepository from "@medusajs/medusa/dist/repositories/money-amount";
+import { isDefined } from "medusa-core-utils";
 
-type InjectedDependencies = {
-  manager: EntityManager;
-  productVariantService: ProductVariantService;
-  taxProviderService: TaxProviderService;
-  regionService: RegionService;
-  priceSelectionStrategy: IPriceSelectionStrategy;
-  featureFlagRouter: FlagRouter;
+type PriceSelectionResultWithMeta = PriceSelectionResult & {
+  metadata?: Record<string, unknown>;
 };
 
-/**
- * Allows retrieval of prices.
- */
-class PricingService extends TransactionBaseService {
-  protected readonly regionService: RegionService;
-  protected readonly taxProviderService: TaxProviderService;
-  protected readonly priceSelectionStrategy: IPriceSelectionStrategy;
-  protected readonly productVariantService: ProductVariantService;
-  protected readonly featureFlagRouter: FlagRouter;
+class PricingService extends MedusaPricingService {
+  protected moneyAmountRepository_: typeof MoneyAmountRepository;
 
-  constructor({
-    productVariantService,
-    taxProviderService,
-    regionService,
-    priceSelectionStrategy,
-    featureFlagRouter,
-  }: InjectedDependencies) {
-    // eslint-disable-next-line prefer-rest-params
+  constructor({ moneyAmountRepository }) {
     super(arguments[0]);
-
-    this.regionService = regionService;
-    this.taxProviderService = taxProviderService;
-    this.priceSelectionStrategy = priceSelectionStrategy;
-    this.productVariantService = productVariantService;
-    this.featureFlagRouter = featureFlagRouter;
+    this.moneyAmountRepository_ = moneyAmountRepository;
   }
-
-  /**
-   * Collects additional information necessary for completing the price
-   * selection.
-   * @param context - the price selection context to use
-   * @return The pricing context
-   */
-  async collectPricingContext(
-    context: PriceSelectionContext
-  ): Promise<PricingContext> {
-    let automaticTaxes = false;
-    let taxRate: number | null = null;
-    let currencyCode = context.currency_code;
-
-    let region: Region;
-    if (context.region_id) {
-      region = await this.regionService
-        .withTransaction(this.activeManager_)
-        .retrieve(context.region_id, {
-          select: ["id", "currency_code", "automatic_taxes", "tax_rate"],
-        });
-
-      currencyCode = region.currency_code;
-      automaticTaxes = region.automatic_taxes;
-      taxRate = region.tax_rate;
-    }
-
-    return {
-      price_selection: {
-        ...context,
-        currency_code: currencyCode,
-      },
-      automatic_taxes: automaticTaxes,
-      tax_rate: taxRate,
-    };
-  }
-
-  /**
-   * Gets the prices for a product variant
-   * @param variantPricing - the prices retrieved from a variant
-   * @param productRates - the tax rates that the product has applied
-   * @return The tax related variant prices.
-   */
-  calculateTaxes(
-    variantPricing: ProductVariantPricing,
-    productRates: TaxServiceRate[]
-  ): TaxedPricing {
-    const rate = productRates.reduce(
-      (accRate: number, nextTaxRate: TaxServiceRate) => {
-        return accRate + (nextTaxRate.rate || 0) / 100;
-      },
-      0
-    );
-
-    const taxedPricing: TaxedPricing = {
-      original_tax: null,
-      calculated_tax: null,
-      original_price_incl_tax: null,
-      calculated_price_incl_tax: null,
-      tax_rates: productRates,
-    };
-
-    if (variantPricing.calculated_price !== null) {
-      const includesTax = !!(
-        this.featureFlagRouter.isFeatureEnabled(
-          TaxInclusivePricingFeatureFlag.key
-        ) && variantPricing.calculated_price_includes_tax
-      );
-      taxedPricing.calculated_tax = Math.round(
-        calculatePriceTaxAmount({
-          price: variantPricing.calculated_price,
-          taxRate: rate,
-          includesTax,
-        })
-      );
-
-      taxedPricing.calculated_price_incl_tax =
-        variantPricing.calculated_price_includes_tax
-          ? variantPricing.calculated_price
-          : variantPricing.calculated_price + taxedPricing.calculated_tax;
-    }
-
-    if (variantPricing.original_price !== null) {
-      const includesTax = !!(
-        this.featureFlagRouter.isFeatureEnabled(
-          TaxInclusivePricingFeatureFlag.key
-        ) && variantPricing.original_price_includes_tax
-      );
-      taxedPricing.original_tax = Math.round(
-        calculatePriceTaxAmount({
-          price: variantPricing.original_price,
-          taxRate: rate,
-          includesTax,
-        })
-      );
-
-      taxedPricing.original_price_incl_tax =
-        variantPricing.original_price_includes_tax
-          ? variantPricing.original_price
-          : variantPricing.original_price + taxedPricing.original_tax;
-    }
-
-    return taxedPricing;
-  }
-
-  private async getProductVariantPricing_(
-    data: {
-      variantId: string;
-      quantity?: number;
-    }[],
-    context: PricingContext
-  ): Promise<Map<string, ProductVariantPricing>> {
-    const variantsPricing = await this.priceSelectionStrategy
-      .withTransaction(this.activeManager_)
-      .calculateVariantPrice(data, context.price_selection);
-
-    const pricingResultMap = new Map();
-
-    for (const [variantId, pricing] of variantsPricing.entries()) {
-      const pricingResult: ProductVariantPricing = {
-        prices: pricing.prices,
-        original_price: pricing.originalPrice,
-        calculated_price: pricing.calculatedPrice,
-        calculated_price_type: pricing.calculatedPriceType,
-        original_price_includes_tax: pricing.originalPriceIncludesTax,
-        calculated_price_includes_tax: pricing.calculatedPriceIncludesTax,
-        original_price_incl_tax: null,
-        calculated_price_incl_tax: null,
-        original_tax: null,
-        calculated_tax: null,
-        tax_rates: null,
-      };
-
-      if (context.automatic_taxes && context.price_selection.region_id) {
-        const taxRates = context.price_selection.tax_rates || [];
-        const taxResults = this.calculateTaxes(pricingResult, taxRates);
-
-        pricingResult.original_price_incl_tax =
-          taxResults.original_price_incl_tax;
-        pricingResult.calculated_price_incl_tax =
-          taxResults.calculated_price_incl_tax;
-        pricingResult.original_tax = taxResults.original_tax;
-        pricingResult.calculated_tax = taxResults.calculated_tax;
-        pricingResult.tax_rates = taxResults.tax_rates;
-      }
-
-      pricingResultMap.set(variantId, pricingResult);
-    }
-
-    return pricingResultMap;
-  }
-
-  /**
-   * Gets the prices for a product variant.
-   * @param variant
-   * @param context - the price selection context to use
-   * @return The product variant prices
-   */
-  async getProductVariantPricing(
-    variant: Pick<ProductVariant, "id" | "product_id">,
-    context: PriceSelectionContext | PricingContext
-  ): Promise<ProductVariantPricing> {
-    let pricingContext: PricingContext;
-    if ("automatic_taxes" in context) {
-      pricingContext = context;
-    } else {
-      pricingContext = await this.collectPricingContext(context);
-    }
-
-    let productRates: Map<string, TaxServiceRate[]> = new Map();
-
-    if (
-      pricingContext.automatic_taxes &&
-      pricingContext.price_selection.region_id
-    ) {
-      // Here we assume that the variants belongs to the same product since the context is shared
-      const productId = variant.product_id;
-      productRates = await this.taxProviderService.getRegionRatesForProduct(
-        productId,
-        {
-          id: pricingContext.price_selection.region_id,
-          tax_rate: pricingContext.tax_rate,
-        }
-      );
-      pricingContext.price_selection.tax_rates = productRates.get(productId);
-    }
-
-    const productVariantPricing = await this.getProductVariantPricing_(
-      [
-        {
-          variantId: variant.id,
-          quantity: pricingContext.price_selection.quantity,
-        },
-      ],
-      pricingContext
-    );
-
-    return productVariantPricing.get(variant.id)!;
-  }
-
-  /**
-   * Gets the prices for a product variant by a variant id.
-   * @param variantId - the id of the variant to get prices for
-   * @param context - the price selection context to use
-   * @return The product variant prices
-   * @deprecated Use {@link getProductVariantsPricing} instead.
-   */
-  async getProductVariantPricingById(
-    variantId: string,
-    context: PriceSelectionContext | PricingContext
-  ): Promise<ProductVariantPricing> {
-    let pricingContext: PricingContext;
-    if ("automatic_taxes" in context) {
-      pricingContext = context;
-    } else {
-      pricingContext = await this.collectPricingContext(context);
-    }
-
-    let productRates: TaxServiceRate[] = [];
-    if (
-      pricingContext.automatic_taxes &&
-      pricingContext.price_selection.region_id
-    ) {
-      const { product_id } = await this.productVariantService
-        .withTransaction(this.activeManager_)
-        .retrieve(variantId, { select: ["id", "product_id"] });
-
-      const regionRatesForProduct = await this.taxProviderService
-        .withTransaction(this.activeManager_)
-        .getRegionRatesForProduct([product_id], {
-          id: pricingContext.price_selection.region_id,
-          tax_rate: pricingContext.tax_rate,
-        });
-
-      productRates = regionRatesForProduct.get(product_id)!;
-    }
-
-    pricingContext.price_selection.tax_rates = productRates;
-    const productVariantPricing = await this.getProductVariantPricing_(
-      [{ variantId }],
-      pricingContext
-    );
-
-    return productVariantPricing.get(variantId)!;
-  }
-
   /**
    * Gets the prices for a collection of variants.
    * @param data
    * @param context - the price selection context to use
    * @return The product variant prices
    */
-  async getProductVariantsPricing(
-    data: { variantId: string; quantity?: number }[],
+  async getProductVariantPricingWithMeta(
+    data: {
+      variantId: string;
+      quantity?: number;
+      metadata?: Record<string, unknown>;
+    },
     context: PriceSelectionContext | PricingContext
-  ): Promise<{ [variant_id: string]: ProductVariantPricing }> {
+  ): Promise<ProductVariantPricing> {
     let pricingContext: PricingContext;
     if ("automatic_taxes" in context) {
       pricingContext = context;
@@ -318,14 +47,9 @@ class PricingService extends TransactionBaseService {
       pricingContext = await this.collectPricingContext(context);
     }
 
-    const dataMap = new Map(data.map((d) => [d.variantId, d]));
-
     const variants = await this.productVariantService
       .withTransaction(this.activeManager_)
-      .list(
-        { id: data.map((d) => d.variantId) },
-        { select: ["id", "product_id"] }
-      );
+      .list({ id: data.variantId }, { select: ["id", "product_id"] });
 
     let productsRatesMap: Map<string, TaxServiceRate[]> = new Map();
 
@@ -343,291 +67,186 @@ class PricingService extends TransactionBaseService {
         productsRatesMap.get(productId)!;
     }
 
-    const variantsPricingMap = await this.getProductVariantPricing_(
-      variants.map((v) => ({
-        variantId: v.id,
-        quantity: dataMap.get(v.id)!.quantity,
-      })),
+    const variantsPricing = await this.generateProductVariantPricing_(
+      data,
       pricingContext
     );
 
-    const pricingResult: { [variant_id: string]: ProductVariantPricing } = {};
-    for (const { variantId } of data) {
-      pricingResult[variantId] = variantsPricingMap.get(variantId)!;
+    return variantsPricing;
+  }
+
+  private async generateProductVariantPricing_(
+    data: {
+      variantId: string;
+      quantity?: number;
+      metadata?: Record<string, unknown>;
+    },
+    context: PricingContext
+  ): Promise<ProductVariantPricing> {
+    const pricing = await this.calculateVariantPriceWithMeta_(
+      data,
+      context.price_selection
+    );
+
+    const pricingResult: ProductVariantPricing = {
+      prices: pricing.prices,
+      original_price: pricing.originalPrice,
+      calculated_price: pricing.calculatedPrice,
+      calculated_price_type: pricing.calculatedPriceType,
+      original_price_includes_tax: pricing.originalPriceIncludesTax,
+      calculated_price_includes_tax: pricing.calculatedPriceIncludesTax,
+      original_price_incl_tax: null,
+      calculated_price_incl_tax: null,
+      original_tax: null,
+      calculated_tax: null,
+      tax_rates: null,
+    };
+
+    if (context.automatic_taxes && context.price_selection.region_id) {
+      const taxRates = context.price_selection.tax_rates || [];
+      const taxResults = this.calculateTaxes(pricingResult, taxRates);
+
+      pricingResult.original_price_incl_tax =
+        taxResults.original_price_incl_tax;
+      pricingResult.calculated_price_incl_tax =
+        taxResults.calculated_price_incl_tax;
+      pricingResult.original_tax = taxResults.original_tax;
+      pricingResult.calculated_tax = taxResults.calculated_tax;
+      pricingResult.tax_rates = taxResults.tax_rates;
     }
 
     return pricingResult;
   }
 
-  private async getProductPricing_(
-    data: { productId: string; variants: ProductVariant[] }[],
-    context: PricingContext
-  ): Promise<Map<string, Record<string, ProductVariantPricing>>> {
-    let taxRatesMap: Map<string, TaxServiceRate[]>;
+  private async calculateVariantPriceWithMeta_(
+    data: {
+      variantId: string;
+      quantity?: number;
+      metadata?: Record<string, unknown>;
+    },
+    context: PriceSelectionContext
+  ): Promise<PriceSelectionResultWithMeta> {
+    const isWindowLineItem = Boolean(
+      data?.metadata?.window_width && data?.metadata?.window_height
+    );
+    const moneyRepo = this.activeManager_.withRepository(
+      this.moneyAmountRepository_
+    );
 
-    if (context.automatic_taxes && context.price_selection.region_id) {
-      taxRatesMap = await this.taxProviderService
-        .withTransaction(this.activeManager_)
-        .getRegionRatesForProduct(
-          data.map((d) => d.productId),
-          {
-            id: context.price_selection.region_id,
-            tax_rate: context.tax_rate,
-          }
-        );
-    }
-
-    const productsPricingMap = new Map<
-      string,
-      Record<string, ProductVariantPricing>
-    >();
-
-    await Promise.all(
-      data.map(async ({ productId, variants }) => {
-        const pricingData = variants.map((variant) => {
-          return { variantId: variant.id };
-        });
-
-        const context_ = { ...context };
-        if (context_.automatic_taxes && context_.price_selection.region_id) {
-          context_.price_selection.tax_rates = taxRatesMap.get(productId)!;
+    const [variantPrices] = await moneyRepo.findManyForVariantsInRegion(
+      [data.variantId],
+      context.region_id,
+      context.currency_code,
+      context.customer_id,
+      context.include_discount_prices
+    );
+    const prices = variantPrices[data.variantId];
+    const result = prices.reduce(
+      (finalPrice, currentPrice) => {
+        if (currentPrice.price_list_id === null) {
+          // The originalPrice is the MoneyAmount that is not associated with a PriceList
+          finalPrice.originalPrice = currentPrice.amount;
         }
 
-        const variantsPricingMap = await this.getProductVariantPricing_(
-          pricingData,
-          context_
+        const isCurrentPriceForWindow = Boolean(
+          currentPrice?.metadata?.window_width &&
+            currentPrice?.metadata?.window_height
         );
 
-        const productVariantsPricing = productsPricingMap.get(productId) || {};
-        variantsPricingMap.forEach((variantPricing, variantId) => {
-          productVariantsPricing[variantId] = variantPricing;
-        });
-        productsPricingMap.set(productId, productVariantsPricing);
-      })
-    );
+        // We only want to evaluate this window price, if the line item was for a window
+        if (isWindowLineItem && isCurrentPriceForWindow) {
+          const isBiggerWindowHeight =
+            currentPrice.metadata?.window_height >=
+            finalPrice.metadata?.window_height;
+          const isBiggerWindowWidth =
+            currentPrice.metadata?.window_width >=
+            finalPrice.metadata?.window_width;
+          const fitsHeightConstraint =
+            data?.metadata?.window_height >=
+            currentPrice.metadata?.window_height;
+          const fitsWidthConstraint =
+            data?.metadata?.window_width >= currentPrice.metadata?.window_width;
+          const doesMatchConstraints =
+            fitsHeightConstraint && fitsWidthConstraint;
 
-    return productsPricingMap;
-  }
+          if (
+            doesMatchConstraints &&
+            (!finalPrice.calculatedPrice ||
+              (isBiggerWindowWidth && isBiggerWindowHeight))
+          ) {
+            // If there is an override for the same dimensions, use the cheaper price
+            const isIdenticalDimensions =
+              currentPrice.metadata?.window_width ===
+                finalPrice.metadata?.window_width &&
+              currentPrice.metadata?.window_height ===
+                finalPrice.metadata?.window_height;
+            const amount = isIdenticalDimensions // If the dimensions are equal, take the lower price
+              ? Math.min(currentPrice.amount, finalPrice.calculatedPrice)
+              : currentPrice.amount;
+            finalPrice.calculatedPrice = amount;
+            finalPrice.metadata = currentPrice.metadata;
+            finalPrice.calculatedPriceType =
+              currentPrice.price_list?.type || PriceType.DEFAULT;
+          }
+        } else if (!isCurrentPriceForWindow && !isWindowLineItem) {
+          // We only want to evaluate this price if the line item was NOT for a window and this price is also not for a window
+          if (
+            context.region_id &&
+            currentPrice.region_id === context.region_id &&
+            currentPrice.price_list_id === null &&
+            currentPrice.min_quantity === null &&
+            currentPrice.max_quantity === null
+          ) {
+            finalPrice.originalPrice = currentPrice.amount;
+          }
 
-  /**
-   * Gets all the variant prices for a product. All the product's variants will
-   * be fetched.
-   * @param product - the product to get pricing for.
-   * @param context - the price selection context to use
-   * @return A map of variant ids to their corresponding prices
-   */
-  async getProductPricing(
-    product: Pick<Product, "id" | "variants">,
-    context: PriceSelectionContext
-  ): Promise<Record<string, ProductVariantPricing>> {
-    const pricingContext = await this.collectPricingContext(context);
-    const productPricing = await this.getProductPricing_(
-      [{ productId: product.id, variants: product.variants }],
-      pricingContext
-    );
-    return productPricing.get(product.id)!;
-  }
+          if (
+            context.currency_code &&
+            currentPrice.currency_code === context.currency_code &&
+            currentPrice.price_list_id === null &&
+            currentPrice.min_quantity === null &&
+            currentPrice.max_quantity === null &&
+            finalPrice.originalPrice === null // region prices take precedence
+          ) {
+            finalPrice.originalPrice = currentPrice.amount;
+          }
+          if (
+            isValidQuantity(currentPrice, data.quantity) &&
+            (finalPrice.calculatedPrice === null ||
+              currentPrice.amount < finalPrice.calculatedPrice) &&
+            ((context.currency_code &&
+              currentPrice.currency_code === context.currency_code) ||
+              (context.region_id &&
+                currentPrice.region_id === context.region_id))
+          ) {
+            finalPrice.calculatedPrice = currentPrice.amount;
+            finalPrice.calculatedPriceType =
+              currentPrice.price_list?.type || PriceType.DEFAULT;
+          }
+        }
 
-  /**
-   * Gets all the variant prices for a product by the product id
-   * @param productId - the id of the product to get prices for
-   * @param context - the price selection context to use
-   * @return A map of variant ids to their corresponding prices
-   */
-  async getProductPricingById(
-    productId: string,
-    context: PriceSelectionContext
-  ): Promise<Record<string, ProductVariantPricing>> {
-    const pricingContext = await this.collectPricingContext(context);
-    const variants = await this.productVariantService.list(
-      { product_id: productId },
-      { select: ["id"] }
-    );
-    const productPricing = await this.getProductPricing_(
-      [{ productId, variants }],
-      pricingContext
-    );
-    return productPricing.get(productId)!;
-  }
-
-  /**
-   * Set additional prices on a list of product variants.
-   * @param variants
-   * @param context - the price selection context to use
-   * @return A list of products with variants decorated with prices
-   */
-  async setVariantPrices(
-    variants: ProductVariant[],
-    context: PriceSelectionContext = {}
-  ): Promise<PricedVariant[]> {
-    const pricingContext = await this.collectPricingContext(context);
-
-    const variantsPricingMap = await this.getProductVariantsPricing(
-      variants.map((v) => ({
-        variantId: v.id,
-        quantity: context.quantity,
-      })),
-      pricingContext
-    );
-
-    return variants.map((variant) => {
-      const variantPricing = variantsPricingMap[variant.id];
-      Object.assign(variant, variantPricing);
-      return variant as unknown as PricedVariant;
-    });
-  }
-
-  /**
-   * Set additional prices on a list of products.
-   * @param products - list of products on which to set additional prices
-   * @param context - the price selection context to use
-   * @return A list of products with variants decorated with prices
-   */
-  async setProductPrices(
-    products: Product[],
-    context: PriceSelectionContext = {}
-  ): Promise<(Product | PricedProduct)[]> {
-    const pricingContext = await this.collectPricingContext(context);
-
-    const pricingData = products
-      .filter((p) => p.variants.length)
-      .map((product) => ({
-        productId: product.id,
-        variants: product.variants,
-      }));
-
-    const productsVariantsPricingMap = await this.getProductPricing_(
-      pricingData,
-      pricingContext
-    );
-
-    return products.map((product) => {
-      if (!product?.variants?.length) {
-        return product;
-      }
-
-      product.variants.map((productVariant): PricedVariant => {
-        const variantPricing = productsVariantsPricingMap.get(product.id)!;
-        const pricing = variantPricing[productVariant.id];
-        Object.assign(productVariant, pricing);
-        return productVariant as unknown as PricedVariant;
-      });
-
-      return product;
-    });
-  }
-
-  /**
-   * Gets the prices for a shipping option.
-   * @param shippingOption - the shipping option to get prices for
-   * @param context - the price selection context to use
-   * @return The shipping option prices
-   */
-  async getShippingOptionPricing(
-    shippingOption: ShippingOption,
-    context: PriceSelectionContext | PricingContext
-  ): Promise<PricedShippingOption> {
-    let pricingContext: PricingContext;
-    if ("automatic_taxes" in context) {
-      pricingContext = context;
-    } else {
-      pricingContext =
-        (context as PricingContext) ??
-        (await this.collectPricingContext(context));
-    }
-
-    let shippingOptionRates: TaxServiceRate[] = [];
-    if (
-      pricingContext.automatic_taxes &&
-      pricingContext.price_selection.region_id
-    ) {
-      shippingOptionRates = await this.taxProviderService
-        .withTransaction(this.activeManager_)
-        .getRegionRatesForShipping(shippingOption.id, {
-          id: pricingContext.price_selection.region_id,
-          tax_rate: pricingContext.tax_rate,
-        });
-    }
-
-    const price = shippingOption.amount || 0;
-    const rate = shippingOptionRates.reduce(
-      (accRate: number, nextTaxRate: TaxServiceRate) => {
-        return accRate + (nextTaxRate.rate || 0) / 100;
+        return finalPrice;
       },
-      0
+      {
+        originalPrice: null,
+        calculatedPrice: null,
+        prices,
+      } as PriceSelectionResultWithMeta
     );
-
-    const includesTax =
-      this.featureFlagRouter.isFeatureEnabled(
-        TaxInclusivePricingFeatureFlag.key
-      ) && shippingOption.includes_tax;
-
-    const taxAmount = Math.round(
-      calculatePriceTaxAmount({
-        taxRate: rate,
-        price,
-        includesTax,
-      })
-    );
-    const totalInclTax = includesTax ? price : price + taxAmount;
-
-    return {
-      ...shippingOption,
-      price_incl_tax: totalInclTax,
-      tax_rates: shippingOptionRates,
-      tax_amount: taxAmount,
-    };
-  }
-
-  /**
-   * Set additional prices on a list of shipping options.
-   * @param shippingOptions - list of shipping options on which to set additional prices
-   * @param context - the price selection context to use
-   * @return A list of shipping options with prices
-   */
-  async setShippingOptionPrices(
-    shippingOptions: ShippingOption[],
-    context: Omit<PriceSelectionContext, "region_id"> = {}
-  ): Promise<PricedShippingOption[]> {
-    const regions = new Set<string>();
-
-    for (const shippingOption of shippingOptions) {
-      regions.add(shippingOption.region_id);
-    }
-
-    const contexts = await Promise.all(
-      [...regions].map(async (regionId) => {
-        return {
-          context: await this.collectPricingContext({
-            ...context,
-            region_id: regionId,
-          }),
-          region_id: regionId,
-        };
-      })
-    );
-
-    const shippingOptionPricingPromises: Promise<PricedShippingOption>[] = [];
-
-    shippingOptions.map(async (shippingOption) => {
-      const pricingContext = contexts.find(
-        (c) => c.region_id === shippingOption.region_id
-      );
-
-      if (!pricingContext) {
-        throw new MedusaError(
-          MedusaError.Types.UNEXPECTED_STATE,
-          "Could not find pricing context for shipping option"
-        );
-      }
-
-      shippingOptionPricingPromises.push(
-        this.getShippingOptionPricing(shippingOption, pricingContext.context)
-      );
-    });
-
-    return await Promise.all(shippingOptionPricingPromises);
+    return result;
   }
 }
+
+const isValidQuantity = (price, quantity?: number): boolean =>
+  (isDefined(quantity) && isValidPriceWithQuantity(price, quantity)) ||
+  (typeof quantity === "undefined" && isValidPriceWithoutQuantity(price));
+
+const isValidPriceWithoutQuantity = (price): boolean =>
+  (!price.max_quantity && !price.min_quantity) ||
+  ((!price.min_quantity || price.min_quantity === 0) && price.max_quantity);
+
+const isValidPriceWithQuantity = (price, quantity): boolean =>
+  (!price.min_quantity || price.min_quantity <= quantity) &&
+  (!price.max_quantity || price.max_quantity >= quantity);
 
 export default PricingService;
